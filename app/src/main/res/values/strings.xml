@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">BrightnessFix</string>
+    <string name="xposed_desc">Allow lower brightness values</string>
+</resources>
