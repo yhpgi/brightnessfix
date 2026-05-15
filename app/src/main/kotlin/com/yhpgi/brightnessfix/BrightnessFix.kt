@@ -38,90 +38,109 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
     }
 
     private fun hookSystemServer(classLoader: ClassLoader) {
-        try {
-            XposedHelpers.findAndHookMethod(
-                "com.android.server.display.brightness.BrightnessRangeController",
-                classLoader,
-                "getCurrentBrightnessMin",
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val currentMin = param.result as? Float ?: return
-                        if (currentMin > minBrightnessFloat) {
-                            param.result = minBrightnessFloat
-                        }
-                    }
-                }
-            )
-        } catch (t: Throwable) {
-            XposedBridge.log("BrightnessFix: failed to hook BrightnessRangeController: ${t.message}")
-        }
-
-        try {
-            XposedHelpers.findAndHookMethod(
-                "com.android.server.display.brightness.DisplayBrightnessController",
-                classLoader,
-                "updateScreenBrightnessSetting",
-                Float::class.javaPrimitiveType,
-                Float::class.javaPrimitiveType,
-                Float::class.javaPrimitiveType,
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val minArg = param.args[1] as? Float ?: return
-                        if (minArg > minBrightnessFloat) {
-                            param.args[1] = minBrightnessFloat
-                        }
-                    }
-                }
-            )
-        } catch (t: Throwable) {
-            XposedBridge.log("BrightnessFix: failed to hook DisplayBrightnessController: ${t.message}")
-        }
-
-        try {
-            XposedHelpers.findAndHookMethod(
-                "com.android.server.display.DisplayPowerController",
-                classLoader,
-                "clampScreenBrightness",
-                Float::class.javaPrimitiveType,
-                object : XC_MethodHook() {
-                    override fun afterHookedMethod(param: MethodHookParam) {
-                        val requested = param.args[0] as? Float ?: return
-                        val clamped = param.result as? Float ?: return
-                        if (requested < minBrightnessFloat) {
-                            param.result = minBrightnessFloat
-                            return
-                        }
-                        if (requested < clamped) {
-                            param.result = requested
-                        }
-                    }
-                }
-            )
-        } catch (t: Throwable) {
-            XposedBridge.log("BrightnessFix: failed to hook DisplayPowerController: ${t.message}")
-        }
+        hookBrightnessClamperController(classLoader)
+        hookDisplayBrightnessController(classLoader)
+        hookDisplayPowerController(classLoader)
     }
 
     private fun hookSystemUi(classLoader: ClassLoader) {
-        try {
-            XposedHelpers.findAndHookMethod(
-                "com.android.systemui.settings.brightness.BrightnessController",
-                classLoader,
-                "updateBrightnessInfo",
-                "android.hardware.display.BrightnessInfo",
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        val info = param.args[0] ?: return
-                        val minField = XposedHelpers.findField(info.javaClass, "brightnessMinimum")
-                        val currentMin = minField.getFloat(info)
-                        if (currentMin > minBrightnessFloat) {
-                            minField.setFloat(info, minBrightnessFloat)
-                        }
+        val controllerClass = XposedHelpers.findClassIfExists(
+            "com.android.systemui.settings.brightness.BrightnessController",
+            classLoader
+        ) ?: return
+
+        XposedBridge.hookAllMethods(
+            controllerClass,
+            "updateBrightnessInfo",
+            object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    setFloatFieldIfHigher(param.thisObject, "mBrightnessMin", minBrightnessFloat)
+                }
+            }
+        )
+    }
+
+    private fun hookBrightnessClamperController(classLoader: ClassLoader) {
+        val clamperClass = XposedHelpers.findClassIfExists(
+            "com.android.server.display.brightness.clamper.BrightnessClamperController",
+            classLoader
+        ) ?: return
+
+        XposedBridge.hookAllMethods(
+            clamperClass,
+            "getMinBrightness",
+            object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val currentMin = param.result as? Float ?: return
+                    if (currentMin > minBrightnessFloat) {
+                        param.result = minBrightnessFloat
                     }
                 }
-            )
-        } catch (t: Throwable) {
-            XposedBridge.log("BrightnessFix: failed to hook SystemUI BrightnessController: ${t.message}")
+            }
+        )
+    }
+
+    private fun hookDisplayBrightnessController(classLoader: ClassLoader) {
+        val controllerClass = XposedHelpers.findClassIfExists(
+            "com.android.server.display.brightness.DisplayBrightnessController",
+            classLoader
+        ) ?: return
+
+        XposedBridge.hookAllMethods(
+            controllerClass,
+            "updateScreenBrightnessSetting",
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val minArg = param.args.getOrNull(1) as? Float ?: return
+                    if (minArg > minBrightnessFloat) {
+                        param.args[1] = minBrightnessFloat
+                    }
+                }
+
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    setFloatFieldIfHigher(
+                        param.thisObject,
+                        "mCurrentMinBrightness",
+                        minBrightnessFloat
+                    )
+                }
+            }
+        )
+    }
+
+    private fun hookDisplayPowerController(classLoader: ClassLoader) {
+        val controllerClass = XposedHelpers.findClassIfExists(
+            "com.android.server.display.DisplayPowerController",
+            classLoader
+        ) ?: return
+
+        XposedBridge.hookAllMethods(
+            controllerClass,
+            "clampScreenBrightness",
+            object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val requested = param.args.getOrNull(0) as? Float ?: return
+                    val clamped = param.result as? Float ?: return
+                    if (requested < minBrightnessFloat) {
+                        param.result = minBrightnessFloat
+                        return
+                    }
+                    if (requested < clamped) {
+                        param.result = requested
+                    }
+                }
+            }
+        )
+    }
+
+    private fun setFloatFieldIfHigher(target: Any?, fieldName: String, minValue: Float) {
+        if (target == null) return
+        try {
+            val currentValue = XposedHelpers.getFloatField(target, fieldName)
+            if (currentValue > minValue) {
+                XposedHelpers.setFloatField(target, fieldName, minValue)
+            }
+        } catch (_: Throwable) {
         }
     }
 
