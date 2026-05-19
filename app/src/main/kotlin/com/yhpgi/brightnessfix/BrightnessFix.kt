@@ -48,6 +48,7 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
     }
 
     private fun hookSystemServer(classLoader: ClassLoader) {
+        hookBrightnessInfo(classLoader, "system")
         hookDisplayDeviceConfig(classLoader)
         hookBrightnessClamperController(classLoader)
         hookDisplayBrightnessController(classLoader)
@@ -57,6 +58,8 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
     }
 
     private fun hookSystemUi(classLoader: ClassLoader) {
+        hookBrightnessInfo(classLoader, "systemui")
+        hookDisplayBrightnessInfo(classLoader)
         val controllerClass = XposedHelpers.findClassIfExists(
             "com.android.systemui.settings.brightness.BrightnessController",
             classLoader
@@ -79,6 +82,72 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
         if (hooks.isEmpty()) {
             hookSystemUiBrightnessInfoMethods(controllerClass, classLoader)
+        }
+    }
+
+    private fun hookBrightnessInfo(classLoader: ClassLoader, tag: String) {
+        val infoClass = XposedHelpers.findClassIfExists(
+            "android.hardware.display.BrightnessInfo",
+            classLoader
+        ) ?: run {
+            logOnce("brightnessinfo_missing_$tag", "BrightnessInfo not found ($tag)")
+            return
+        }
+
+        val hooks = XposedBridge.hookAllConstructors(
+            infoClass,
+            object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    if (clampBrightnessInfoMin(param.thisObject)) {
+                        logOnce("brightnessinfo_adjusted_$tag", "BrightnessInfo min adjusted ($tag)")
+                    }
+                }
+            }
+        )
+        logHookResult("brightnessinfo_hooks_$tag", "BrightnessInfo constructors ($tag)", hooks.size)
+    }
+
+    private fun hookDisplayBrightnessInfo(classLoader: ClassLoader) {
+        val displayClass = XposedHelpers.findClassIfExists(
+            "android.view.Display",
+            classLoader
+        )
+        if (displayClass != null) {
+            val hooks = XposedBridge.hookAllMethods(
+                displayClass,
+                "getBrightnessInfo",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (clampBrightnessInfoMin(param.result)) {
+                            logOnce("display_brightnessinfo", "Display.getBrightnessInfo adjusted")
+                        }
+                    }
+                }
+            )
+            logHookResult("display_brightnessinfo_hooks", "Display#getBrightnessInfo", hooks.size)
+        } else {
+            logOnce("display_missing", "Display class not found in SystemUI")
+        }
+
+        val managerClass = XposedHelpers.findClassIfExists(
+            "android.hardware.display.DisplayManager",
+            classLoader
+        )
+        if (managerClass != null) {
+            val hooks = XposedBridge.hookAllMethods(
+                managerClass,
+                "getBrightnessInfo",
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        if (clampBrightnessInfoMin(param.result)) {
+                            logOnce("dm_brightnessinfo", "DisplayManager.getBrightnessInfo adjusted")
+                        }
+                    }
+                }
+            )
+            logHookResult("dm_brightnessinfo_hooks", "DisplayManager#getBrightnessInfo", hooks.size)
+        } else {
+            logOnce("displaymanager_missing", "DisplayManager not found in SystemUI")
         }
     }
 
@@ -349,14 +418,30 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
     }
 
     private fun setFloatFieldIfHigher(target: Any?, fieldName: String, minValue: Float) {
-        if (target == null) return
-        try {
+        trySetFloatFieldIfHigher(target, fieldName, minValue)
+    }
+
+    private fun trySetFloatFieldIfHigher(target: Any?, fieldName: String, minValue: Float): Boolean {
+        if (target == null) return false
+        return try {
             val currentValue = XposedHelpers.getFloatField(target, fieldName)
             if (currentValue > minValue) {
                 XposedHelpers.setFloatField(target, fieldName, minValue)
+                true
+            } else {
+                false
             }
         } catch (_: Throwable) {
+            false
         }
+    }
+
+    private fun clampBrightnessInfoMin(info: Any?): Boolean {
+        var changed = false
+        changed = trySetFloatFieldIfHigher(info, "brightnessMinimum", minBrightnessFloat) || changed
+        changed = trySetFloatFieldIfHigher(info, "mBrightnessMinimum", minBrightnessFloat) || changed
+        changed = trySetFloatFieldIfHigher(info, "mMinimumBrightness", minBrightnessFloat) || changed
+        return changed
     }
 
     private fun setSystemUiMin(target: Any?) {
