@@ -14,12 +14,15 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
     private val minBrightnessFloat = minBrightnessInt / 255f
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam?) {
+        XposedBridge.log("BrightnessFix: initZygote starting, minBrightnessFloat=$minBrightnessFloat")
+        
         XResources.setSystemWideReplacement(
             "android",
             "integer",
             "config_screenBrightnessSettingMinimum",
             minBrightnessInt
         )
+        XposedBridge.log("BrightnessFix: replaced config_screenBrightnessSettingMinimum with $minBrightnessInt")
 
         // Android 16 QPR2 uses the float config for clamping the slider minimum.
         XResources.setSystemWideReplacement(
@@ -28,6 +31,7 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
             "config_screenBrightnessSettingMinimumFloat",
             minBrightnessFloat
         )
+        XposedBridge.log("BrightnessFix: replaced config_screenBrightnessSettingMinimumFloat with $minBrightnessFloat")
     }
 
     override fun handleLoadPackage(lpparam: XC_LoadPackage.LoadPackageParam) {
@@ -47,14 +51,28 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
         val controllerClass = XposedHelpers.findClassIfExists(
             "com.android.systemui.settings.brightness.BrightnessController",
             classLoader
-        ) ?: return
-
+        )
+        if (controllerClass == null) {
+            XposedBridge.log("BrightnessFix: SystemUI BrightnessController not found")
+            return
+        }
+        
+        XposedBridge.log("BrightnessFix: hooking SystemUI BrightnessController.updateBrightnessInfo")
         XposedBridge.hookAllMethods(
             controllerClass,
             "updateBrightnessInfo",
             object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    setFloatFieldIfHigher(param.thisObject, "mBrightnessMin", minBrightnessFloat)
+                    try {
+                        val currentMin = XposedHelpers.getFloatField(param.thisObject, "mBrightnessMin")
+                        XposedBridge.log("BrightnessFix: updateBrightnessInfo, mBrightnessMin=$currentMin")
+                        if (currentMin > minBrightnessFloat) {
+                            XposedBridge.log("BrightnessFix: overriding mBrightnessMin from $currentMin to $minBrightnessFloat")
+                            XposedHelpers.setFloatField(param.thisObject, "mBrightnessMin", minBrightnessFloat)
+                        }
+                    } catch (t: Throwable) {
+                        XposedBridge.log("BrightnessFix: error in updateBrightnessInfo hook: ${t.message}")
+                    }
                 }
             }
         )
@@ -64,15 +82,22 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
         val clamperClass = XposedHelpers.findClassIfExists(
             "com.android.server.display.brightness.clamper.BrightnessClamperController",
             classLoader
-        ) ?: return
-
+        )
+        if (clamperClass == null) {
+            XposedBridge.log("BrightnessFix: BrightnessClamperController not found")
+            return
+        }
+        
+        XposedBridge.log("BrightnessFix: hooking BrightnessClamperController.getMinBrightness")
         XposedBridge.hookAllMethods(
             clamperClass,
             "getMinBrightness",
             object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
                     val currentMin = param.result as? Float ?: return
+                    XposedBridge.log("BrightnessFix: getMinBrightness called, result=$currentMin")
                     if (currentMin > minBrightnessFloat) {
+                        XposedBridge.log("BrightnessFix: overriding min from $currentMin to $minBrightnessFloat")
                         param.result = minBrightnessFloat
                     }
                 }
@@ -84,15 +109,22 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
         val controllerClass = XposedHelpers.findClassIfExists(
             "com.android.server.display.brightness.DisplayBrightnessController",
             classLoader
-        ) ?: return
-
+        )
+        if (controllerClass == null) {
+            XposedBridge.log("BrightnessFix: DisplayBrightnessController not found")
+            return
+        }
+        
+        XposedBridge.log("BrightnessFix: hooking DisplayBrightnessController.updateScreenBrightnessSetting")
         XposedBridge.hookAllMethods(
             controllerClass,
             "updateScreenBrightnessSetting",
             object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
-                    val minArg = param.args.getOrNull(1) as? Float ?: return
-                    if (minArg > minBrightnessFloat) {
+                    val minArg = param.args.getOrNull(1) as? Float
+                    XposedBridge.log("BrightnessFix: updateScreenBrightnessSetting called with minArg=$minArg")
+                    if (minArg != null && minArg > minBrightnessFloat) {
+                        XposedBridge.log("BrightnessFix: overriding minBrightness arg from $minArg to $minBrightnessFloat")
                         param.args[1] = minBrightnessFloat
                     }
                 }
@@ -137,10 +169,13 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
         if (target == null) return
         try {
             val currentValue = XposedHelpers.getFloatField(target, fieldName)
+            XposedBridge.log("BrightnessFix: setFloatFieldIfHigher($fieldName): current=$currentValue, min=$minValue")
             if (currentValue > minValue) {
+                XposedBridge.log("BrightnessFix: setting $fieldName to $minValue")
                 XposedHelpers.setFloatField(target, fieldName, minValue)
             }
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
+            XposedBridge.log("BrightnessFix: error in setFloatFieldIfHigher($fieldName): ${t.message}")
         }
     }
 
