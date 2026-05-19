@@ -48,9 +48,11 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
     }
 
     private fun hookSystemServer(classLoader: ClassLoader) {
+        hookDisplayDeviceConfig(classLoader)
         hookBrightnessClamperController(classLoader)
         hookDisplayBrightnessController(classLoader)
         hookDisplayBrightnessStateBuilder(classLoader)
+        hookDisplayBrightnessState(classLoader)
         hookDisplayPowerController(classLoader)
     }
 
@@ -68,12 +70,109 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
             "updateBrightnessInfo",
             object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
-                    setFloatFieldIfHigher(param.thisObject, "mBrightnessMin", minBrightnessFloat)
+                    setSystemUiMin(param.thisObject)
                     logOnce("systemui_update", "SystemUI updateBrightnessInfo observed")
                 }
             }
         )
         logHookResult("systemui_update_hooks", "SystemUI updateBrightnessInfo", hooks.size)
+
+        if (hooks.isEmpty()) {
+            hookSystemUiBrightnessInfoMethods(controllerClass, classLoader)
+        }
+    }
+
+    private fun hookSystemUiBrightnessInfoMethods(
+        controllerClass: Class<*>,
+        classLoader: ClassLoader
+    ) {
+        val brightnessInfoClass = XposedHelpers.findClassIfExists(
+            "android.hardware.display.BrightnessInfo",
+            classLoader
+        ) ?: run {
+            logOnce("systemui_brightnessinfo_missing", "SystemUI BrightnessInfo not found")
+            return
+        }
+
+        val methods = controllerClass.declaredMethods.filter { method ->
+            method.parameterTypes.any { it == brightnessInfoClass }
+        }
+
+        if (methods.isEmpty()) {
+            logOnce(
+                "systemui_brightnessinfo_no_methods",
+                "SystemUI BrightnessInfo methods not found"
+            )
+            return
+        }
+
+        for (method in methods) {
+            XposedBridge.hookMethod(
+                method,
+                object : XC_MethodHook() {
+                    override fun afterHookedMethod(param: MethodHookParam) {
+                        setSystemUiMin(param.thisObject)
+                        logOnce(
+                            "systemui_brightnessinfo_called_${method.name}",
+                            "SystemUI ${method.name} observed"
+                        )
+                    }
+                }
+            )
+        }
+
+        logOnce(
+            "systemui_brightnessinfo_hooks",
+            "SystemUI BrightnessInfo hooks (${methods.size})"
+        )
+    }
+
+    private fun hookDisplayDeviceConfig(classLoader: ClassLoader) {
+        val configClass = XposedHelpers.findClassIfExists(
+            "com.android.server.display.DisplayDeviceConfig",
+            classLoader
+        ) ?: run {
+            logOnce("ddc_missing", "DisplayDeviceConfig not found")
+            return
+        }
+
+        val minHooks = XposedBridge.hookAllMethods(
+            configClass,
+            "getBrightnessMinimum",
+            object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val currentMin = param.result as? Float ?: return
+                    if (currentMin > minBrightnessFloat) {
+                        param.result = minBrightnessFloat
+                    }
+                    logOnce("ddc_min", "DisplayDeviceConfig#getBrightnessMinimum current=$currentMin")
+                }
+            }
+        )
+        logHookResult("ddc_min_hooks", "DisplayDeviceConfig#getBrightnessMinimum", minHooks.size)
+
+        val backlightHooks = XposedBridge.hookAllMethods(
+            configClass,
+            "getBacklightFromBrightness",
+            object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val brightness = param.args.getOrNull(0) as? Float ?: return
+                    val backlight = param.result as? Float ?: return
+                    if (brightness <= minBrightnessFloat && backlight > brightness) {
+                        param.result = brightness
+                        logOnce(
+                            "ddc_backlight",
+                            "getBacklightFromBrightness brightness=$brightness backlight=$backlight"
+                        )
+                    }
+                }
+            }
+        )
+        logHookResult(
+            "ddc_backlight_hooks",
+            "DisplayDeviceConfig#getBacklightFromBrightness",
+            backlightHooks.size
+        )
     }
 
     private fun hookBrightnessClamperController(classLoader: ClassLoader) {
@@ -174,6 +273,49 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
         if (!hookedAny) {
             logOnce("dbs_builder_no_methods", "No min setter found on DisplayBrightnessState.Builder")
         }
+
+        val buildHooks = XposedBridge.hookAllMethods(
+            builderClass,
+            "build",
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    setFloatFieldIfHigher(param.thisObject, "mMinBrightness", minBrightnessFloat)
+                    setFloatFieldIfHigher(param.thisObject, "mBrightnessMin", minBrightnessFloat)
+                    try {
+                        val currentMin = XposedHelpers.getFloatField(param.thisObject, "mMinBrightness")
+                        logOnce("dbs_builder_build", "DisplayBrightnessState.Builder#build min=$currentMin")
+                    } catch (_: Throwable) {
+                        logOnce("dbs_builder_build", "DisplayBrightnessState.Builder#build observed")
+                    }
+                }
+            }
+        )
+        logHookResult("dbs_builder_build_hooks", "DisplayBrightnessState.Builder#build", buildHooks.size)
+    }
+
+    private fun hookDisplayBrightnessState(classLoader: ClassLoader) {
+        val stateClass = XposedHelpers.findClassIfExists(
+            "com.android.server.display.DisplayBrightnessState",
+            classLoader
+        ) ?: run {
+            logOnce("dbs_missing", "DisplayBrightnessState not found")
+            return
+        }
+
+        val hooks = XposedBridge.hookAllMethods(
+            stateClass,
+            "getMinBrightness",
+            object : XC_MethodHook() {
+                override fun afterHookedMethod(param: MethodHookParam) {
+                    val currentMin = param.result as? Float ?: return
+                    if (currentMin > minBrightnessFloat) {
+                        param.result = minBrightnessFloat
+                    }
+                    logOnce("dbs_min", "DisplayBrightnessState#getMinBrightness current=$currentMin")
+                }
+            }
+        )
+        logHookResult("dbs_min_hooks", "DisplayBrightnessState#getMinBrightness", hooks.size)
     }
 
     private fun hookDisplayPowerController(classLoader: ClassLoader) {
@@ -215,6 +357,13 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
             }
         } catch (_: Throwable) {
         }
+    }
+
+    private fun setSystemUiMin(target: Any?) {
+        setFloatFieldIfHigher(target, "mBrightnessMin", minBrightnessFloat)
+        setFloatFieldIfHigher(target, "mMinimumBrightness", minBrightnessFloat)
+        setFloatFieldIfHigher(target, "mMinBrightness", minBrightnessFloat)
+        setFloatFieldIfHigher(target, "mBrightnessMinimum", minBrightnessFloat)
     }
 
     private fun logHookResult(key: String, label: String, hookCount: Int) {
