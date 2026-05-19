@@ -8,6 +8,7 @@ import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
 
 class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
@@ -15,6 +16,7 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
     private val minBrightnessInt = 1
     private val minBrightnessFloat = minBrightnessInt / 255f
     private val loggedKeys = ConcurrentHashMap<String, Boolean>()
+    private val lastFloatValues = ConcurrentHashMap<String, Float>()
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam?) {
         logOnce("zygote", "initZygote minBrightnessFloat=$minBrightnessFloat")
@@ -60,6 +62,7 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
     private fun hookSystemUi(classLoader: ClassLoader) {
         hookBrightnessInfo(classLoader, "systemui")
         hookDisplayBrightnessInfo(classLoader)
+        hookSettingsSystem(classLoader)
         val controllerClass = XposedHelpers.findClassIfExists(
             "com.android.systemui.settings.brightness.BrightnessController",
             classLoader
@@ -98,6 +101,7 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
             infoClass,
             object : XC_MethodHook() {
                 override fun afterHookedMethod(param: MethodHookParam) {
+                    logBrightnessInfoValues("brightnessinfo_$tag", param.thisObject)
                     if (clampBrightnessInfoMin(param.thisObject)) {
                         logOnce("brightnessinfo_adjusted_$tag", "BrightnessInfo min adjusted ($tag)")
                     }
@@ -118,6 +122,7 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 "getBrightnessInfo",
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
+                        logBrightnessInfoValues("display_get", param.result)
                         if (clampBrightnessInfoMin(param.result)) {
                             logOnce("display_brightnessinfo", "Display.getBrightnessInfo adjusted")
                         }
@@ -139,6 +144,7 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 "getBrightnessInfo",
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
+                        logBrightnessInfoValues("displaymanager_get", param.result)
                         if (clampBrightnessInfoMin(param.result)) {
                             logOnce("dm_brightnessinfo", "DisplayManager.getBrightnessInfo adjusted")
                         }
@@ -262,7 +268,7 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     if (currentMin > minBrightnessFloat) {
                         param.result = minBrightnessFloat
                     }
-                    logOnce("clamper_called", "getMinBrightness currentMin=$currentMin")
+                    logWhenValueChanges("clamper_min", currentMin, "getMinBrightness currentMin=$currentMin")
                 }
             }
         )
@@ -283,11 +289,12 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
             "updateScreenBrightnessSetting",
             object : XC_MethodHook() {
                 override fun beforeHookedMethod(param: MethodHookParam) {
+                    logUpdateScreenBrightnessArgsOnce(param)
                     val minArg = param.args.getOrNull(1) as? Float ?: return
                     if (minArg > minBrightnessFloat) {
                         param.args[1] = minBrightnessFloat
                     }
-                    logOnce("dbc_called", "updateScreenBrightnessSetting minArg=$minArg")
+                    logWhenValueChanges("dbc_min_arg", minArg, "updateScreenBrightnessSetting minArg=$minArg")
                 }
 
                 override fun afterHookedMethod(param: MethodHookParam) {
@@ -329,7 +336,11 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
                         if (minArg > minBrightnessFloat) {
                             param.args[0] = minBrightnessFloat
                         }
-                        logOnce("dbs_builder_called", "DisplayBrightnessState.Builder $methodName minArg=$minArg")
+                        logWhenValueChanges(
+                            "dbs_builder_min_arg",
+                            minArg,
+                            "DisplayBrightnessState.Builder $methodName minArg=$minArg"
+                        )
                     }
                 }
             )
@@ -352,7 +363,11 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     setFloatFieldIfHigher(param.thisObject, "mBrightnessMin", minBrightnessFloat)
                     try {
                         val currentMin = XposedHelpers.getFloatField(param.thisObject, "mMinBrightness")
-                        logOnce("dbs_builder_build", "DisplayBrightnessState.Builder#build min=$currentMin")
+                        logWhenValueChanges(
+                            "dbs_builder_build",
+                            currentMin,
+                            "DisplayBrightnessState.Builder#build min=$currentMin"
+                        )
                     } catch (_: Throwable) {
                         logOnce("dbs_builder_build", "DisplayBrightnessState.Builder#build observed")
                     }
@@ -380,7 +395,11 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     if (currentMin > minBrightnessFloat) {
                         param.result = minBrightnessFloat
                     }
-                    logOnce("dbs_min", "DisplayBrightnessState#getMinBrightness current=$currentMin")
+                    logWhenValueChanges(
+                        "dbs_min",
+                        currentMin,
+                        "DisplayBrightnessState#getMinBrightness current=$currentMin"
+                    )
                 }
             }
         )
@@ -410,11 +429,97 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
                     if (requested < clamped) {
                         param.result = requested
                     }
-                    logOnce("dpc_called", "clampScreenBrightness requested=$requested clamped=$clamped")
+                    logWhenValueChanges(
+                        "dpc_requested",
+                        requested,
+                        "clampScreenBrightness requested=$requested clamped=$clamped"
+                    )
                 }
             }
         )
         logHookResult("dpc_hooks", "DisplayPowerController#clampScreenBrightness", hooks.size)
+    }
+
+    private fun hookSettingsSystem(classLoader: ClassLoader) {
+        val settingsClass = XposedHelpers.findClassIfExists(
+            "android.provider.Settings\$System",
+            classLoader
+        ) ?: run {
+            logOnce("settings_missing", "Settings.System not found")
+            return
+        }
+
+        val floatHooks = XposedBridge.hookAllMethods(
+            settingsClass,
+            "putFloat",
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val key = findStringArg(param.args) ?: return
+                    if (key != "screen_brightness_float") return
+                    val value = findFloatArg(param.args) ?: return
+                    logWhenValueChanges(
+                        "settings_brightness_float",
+                        value,
+                        "Settings.System.putFloat screen_brightness_float=$value"
+                    )
+                }
+            }
+        )
+        logHookResult("settings_putfloat", "Settings.System#putFloat", floatHooks.size)
+
+        val floatUserHooks = XposedBridge.hookAllMethods(
+            settingsClass,
+            "putFloatForUser",
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val key = findStringArg(param.args) ?: return
+                    if (key != "screen_brightness_float") return
+                    val value = findFloatArg(param.args) ?: return
+                    logWhenValueChanges(
+                        "settings_brightness_float_user",
+                        value,
+                        "Settings.System.putFloatForUser screen_brightness_float=$value"
+                    )
+                }
+            }
+        )
+        logHookResult("settings_putfloat_user", "Settings.System#putFloatForUser", floatUserHooks.size)
+
+        val intHooks = XposedBridge.hookAllMethods(
+            settingsClass,
+            "putInt",
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val key = findStringArg(param.args) ?: return
+                    if (key != "screen_brightness") return
+                    val value = findIntArg(param.args) ?: return
+                    logWhenValueChanges(
+                        "settings_brightness_int",
+                        value.toFloat(),
+                        "Settings.System.putInt screen_brightness=$value"
+                    )
+                }
+            }
+        )
+        logHookResult("settings_putint", "Settings.System#putInt", intHooks.size)
+
+        val intUserHooks = XposedBridge.hookAllMethods(
+            settingsClass,
+            "putIntForUser",
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    val key = findStringArg(param.args) ?: return
+                    if (key != "screen_brightness") return
+                    val value = findIntArg(param.args) ?: return
+                    logWhenValueChanges(
+                        "settings_brightness_int_user",
+                        value.toFloat(),
+                        "Settings.System.putIntForUser screen_brightness=$value"
+                    )
+                }
+            }
+        )
+        logHookResult("settings_putint_user", "Settings.System#putIntForUser", intUserHooks.size)
     }
 
     private fun setFloatFieldIfHigher(target: Any?, fieldName: String, minValue: Float) {
@@ -444,6 +549,63 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
         return changed
     }
 
+    private fun logBrightnessInfoValues(keyPrefix: String, info: Any?) {
+        val min = getBrightnessInfoValue(info, "brightnessMinimum")
+        if (!min.isNaN()) {
+            logWhenValueChanges("${keyPrefix}_min", min, "$keyPrefix brightnessMinimum=$min")
+        }
+        val max = getBrightnessInfoValue(info, "brightnessMaximum")
+        if (!max.isNaN()) {
+            logWhenValueChanges("${keyPrefix}_max", max, "$keyPrefix brightnessMaximum=$max")
+        }
+        val brightness = getBrightnessInfoValue(info, "brightness")
+        if (!brightness.isNaN()) {
+            logWhenValueChanges("${keyPrefix}_brightness", brightness, "$keyPrefix brightness=$brightness")
+        }
+    }
+
+    private fun getBrightnessInfoValue(info: Any?, fieldName: String): Float {
+        if (info == null) return Float.NaN
+        return try {
+            XposedHelpers.getFloatField(info, fieldName)
+        } catch (_: Throwable) {
+            Float.NaN
+        }
+    }
+
+    private fun findStringArg(args: Array<Any?>): String? {
+        for (arg in args) {
+            if (arg is String) return arg
+        }
+        return null
+    }
+
+    private fun findFloatArg(args: Array<Any?>): Float? {
+        for (arg in args) {
+            when (arg) {
+                is Float -> return arg
+                is Double -> return arg.toFloat()
+            }
+        }
+        return null
+    }
+
+    private fun findIntArg(args: Array<Any?>): Int? {
+        for (arg in args) {
+            if (arg is Int) return arg
+        }
+        return null
+    }
+
+    private fun logUpdateScreenBrightnessArgsOnce(param: XC_MethodHook.MethodHookParam) {
+        val floatArgs = param.args.mapIndexedNotNull { index, arg ->
+            if (arg is Float) "$index=$arg" else null
+        }
+        if (floatArgs.isNotEmpty()) {
+            logOnce("dbc_args", "updateScreenBrightnessSetting floatArgs=${floatArgs.joinToString()}")
+        }
+    }
+
     private fun setSystemUiMin(target: Any?) {
         setFloatFieldIfHigher(target, "mBrightnessMin", minBrightnessFloat)
         setFloatFieldIfHigher(target, "mMinimumBrightness", minBrightnessFloat)
@@ -458,6 +620,14 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
     private fun logOnce(key: String, message: String) {
         if (loggedKeys.putIfAbsent(key, true) == null) {
+            XposedBridge.log("$logTag: $message")
+        }
+    }
+
+    private fun logWhenValueChanges(key: String, value: Float, message: String) {
+        if (value.isNaN()) return
+        val prev = lastFloatValues.put(key, value)
+        if (prev == null || abs(prev - value) > 0.0001f) {
             XposedBridge.log("$logTag: $message")
         }
     }
