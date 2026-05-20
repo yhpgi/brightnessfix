@@ -13,7 +13,7 @@ import kotlin.math.abs
 class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
     private val logTag = "BrightnessFix"
-    private val minBrightnessInt = 1
+    private val minBrightnessInt = 0
     private val minBrightnessFloat = minBrightnessInt / 255f
     private val loggedKeys = ConcurrentHashMap<String, Boolean>()
     private val lastFloatValues = ConcurrentHashMap<String, Float>()
