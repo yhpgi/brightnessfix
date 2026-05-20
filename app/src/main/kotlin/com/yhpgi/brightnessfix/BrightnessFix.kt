@@ -62,6 +62,7 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
     private fun hookSystemUi(classLoader: ClassLoader) {
         hookBrightnessInfo(classLoader, "systemui")
         hookDisplayBrightnessInfo(classLoader)
+        hookDisplayManagerBrightnessSetters(classLoader)
         hookSettingsSystem(classLoader)
         val controllerClass = XposedHelpers.findClassIfExists(
             "com.android.systemui.settings.brightness.BrightnessController",
@@ -123,7 +124,9 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         logBrightnessInfoValues("display_get", param.result)
-                        if (clampBrightnessInfoMin(param.result)) {
+                        val replaced = replaceBrightnessInfoMin(param.result, "display_get")
+                        if (replaced != null) {
+                            param.result = replaced
                             logOnce("display_brightnessinfo", "Display.getBrightnessInfo adjusted")
                         }
                     }
@@ -145,7 +148,9 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
                 object : XC_MethodHook() {
                     override fun afterHookedMethod(param: MethodHookParam) {
                         logBrightnessInfoValues("displaymanager_get", param.result)
-                        if (clampBrightnessInfoMin(param.result)) {
+                        val replaced = replaceBrightnessInfoMin(param.result, "displaymanager_get")
+                        if (replaced != null) {
+                            param.result = replaced
                             logOnce("dm_brightnessinfo", "DisplayManager.getBrightnessInfo adjusted")
                         }
                     }
@@ -155,6 +160,46 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
         } else {
             logOnce("displaymanager_missing", "DisplayManager not found in SystemUI")
         }
+    }
+
+    private fun hookDisplayManagerBrightnessSetters(classLoader: ClassLoader) {
+        val managerClass = XposedHelpers.findClassIfExists(
+            "android.hardware.display.DisplayManager",
+            classLoader
+        ) ?: run {
+            logOnce("displaymanager_missing_setters", "DisplayManager not found for setters")
+            return
+        }
+
+        var count = 0
+        for (method in managerClass.declaredMethods) {
+            if (!method.name.contains("Brightness", ignoreCase = true)) continue
+            if (!method.parameterTypes.any { it == Float::class.javaPrimitiveType || it == Float::class.java }) {
+                continue
+            }
+            XposedBridge.hookMethod(
+                method,
+                object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        val floatArgs = param.args.mapIndexedNotNull { index, arg ->
+                            if (arg is Float) "$index=$arg" else null
+                        }
+                        if (floatArgs.isNotEmpty()) {
+                            val firstValue = param.args.firstOrNull { it is Float } as? Float
+                            val message = "DisplayManager.${method.name} floatArgs=${floatArgs.joinToString()}"
+                            if (firstValue != null) {
+                                logWhenValueChanges("dm_set_${method.name}", firstValue, message)
+                            } else {
+                                XposedBridge.log("$logTag: $message")
+                            }
+                        }
+                    }
+                }
+            )
+            count += 1
+        }
+
+        logOnce("displaymanager_setters", "DisplayManager brightness setters hooked ($count)")
     }
 
     private fun hookSystemUiBrightnessInfoMethods(
@@ -549,28 +594,115 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
         return changed
     }
 
+    private fun replaceBrightnessInfoMin(info: Any?, source: String): Any? {
+        if (info == null) return null
+        val infoClass = info.javaClass
+        if (infoClass.name != "android.hardware.display.BrightnessInfo") return null
+
+        val brightness = getBrightnessInfoValue(info, listOf("brightness", "mBrightness"))
+        val adjusted = getBrightnessInfoValue(info, listOf("adjustedBrightness", "mAdjustedBrightness"))
+        val currentMin = getBrightnessInfoValue(
+            info,
+            listOf("brightnessMinimum", "mBrightnessMinimum", "mMinimumBrightness")
+        )
+        val max = getBrightnessInfoValue(info, listOf("brightnessMaximum", "mBrightnessMaximum"))
+        val hbm = getIntField(info, listOf("highBrightnessMode", "mHighBrightnessMode"))
+        val transition = getBrightnessInfoValue(
+            info,
+            listOf("highBrightnessTransitionPoint", "mHighBrightnessTransitionPoint")
+        )
+        val maxReason = getIntField(info, listOf("brightnessMaxReason", "mBrightnessMaxReason"))
+        val overrideByWindow = getBooleanField(
+            info,
+            listOf("isBrightnessOverrideByWindow", "mIsBrightnessOverrideByWindow")
+        )
+
+        if (brightness.isNaN() || max.isNaN() || transition.isNaN()) {
+            logOnce("brightnessinfo_missing_$source", "BrightnessInfo fields missing ($source)")
+            return null
+        }
+
+        val newMin = if (!currentMin.isNaN() && currentMin <= minBrightnessFloat) {
+            currentMin
+        } else {
+            minBrightnessFloat
+        }
+
+        return try {
+            XposedHelpers.newInstance(
+                infoClass,
+                brightness,
+                if (adjusted.isNaN()) brightness else adjusted,
+                newMin,
+                max,
+                hbm,
+                transition,
+                maxReason,
+                overrideByWindow
+            )
+        } catch (_: Throwable) {
+            try {
+                XposedHelpers.newInstance(
+                    infoClass,
+                    brightness,
+                    newMin,
+                    max,
+                    hbm,
+                    transition,
+                    maxReason
+                )
+            } catch (_: Throwable) {
+                null
+            }
+        }
+    }
+
     private fun logBrightnessInfoValues(keyPrefix: String, info: Any?) {
-        val min = getBrightnessInfoValue(info, "brightnessMinimum")
+        val min = getBrightnessInfoValue(info, listOf("brightnessMinimum", "mBrightnessMinimum"))
         if (!min.isNaN()) {
             logWhenValueChanges("${keyPrefix}_min", min, "$keyPrefix brightnessMinimum=$min")
         }
-        val max = getBrightnessInfoValue(info, "brightnessMaximum")
+        val max = getBrightnessInfoValue(info, listOf("brightnessMaximum", "mBrightnessMaximum"))
         if (!max.isNaN()) {
             logWhenValueChanges("${keyPrefix}_max", max, "$keyPrefix brightnessMaximum=$max")
         }
-        val brightness = getBrightnessInfoValue(info, "brightness")
+        val brightness = getBrightnessInfoValue(info, listOf("brightness", "mBrightness"))
         if (!brightness.isNaN()) {
             logWhenValueChanges("${keyPrefix}_brightness", brightness, "$keyPrefix brightness=$brightness")
         }
     }
 
-    private fun getBrightnessInfoValue(info: Any?, fieldName: String): Float {
+    private fun getBrightnessInfoValue(info: Any?, fieldNames: List<String>): Float {
         if (info == null) return Float.NaN
-        return try {
-            XposedHelpers.getFloatField(info, fieldName)
-        } catch (_: Throwable) {
-            Float.NaN
+        for (name in fieldNames) {
+            try {
+                return XposedHelpers.getFloatField(info, name)
+            } catch (_: Throwable) {
+            }
         }
+        return Float.NaN
+    }
+
+    private fun getIntField(info: Any?, fieldNames: List<String>): Int {
+        if (info == null) return 0
+        for (name in fieldNames) {
+            try {
+                return XposedHelpers.getIntField(info, name)
+            } catch (_: Throwable) {
+            }
+        }
+        return 0
+    }
+
+    private fun getBooleanField(info: Any?, fieldNames: List<String>): Boolean {
+        if (info == null) return false
+        for (name in fieldNames) {
+            try {
+                return XposedHelpers.getBooleanField(info, name)
+            } catch (_: Throwable) {
+            }
+        }
+        return false
     }
 
     private fun findStringArg(args: Array<Any?>): String? {
