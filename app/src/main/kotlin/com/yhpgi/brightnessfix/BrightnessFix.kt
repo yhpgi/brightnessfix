@@ -7,8 +7,11 @@ import de.robv.android.xposed.XC_MethodHook
 import de.robv.android.xposed.XposedBridge
 import de.robv.android.xposed.XposedHelpers
 import de.robv.android.xposed.callbacks.XC_LoadPackage
+import java.io.File
+import java.io.FileOutputStream
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
@@ -17,6 +20,15 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
     private val minBrightnessFloat = minBrightnessInt / 255f
     private val loggedKeys = ConcurrentHashMap<String, Boolean>()
     private val lastFloatValues = ConcurrentHashMap<String, Float>()
+    private val sysfsOverrideEnabled = true
+    private val sysfsOverrideThreshold = 0.05f
+    private val sysfsBacklightPath = "/sys/class/leds/lcd-backlight/brightness"
+    private val sysfsMaxBacklightPath = "/sys/class/leds/lcd-backlight/max_brightness"
+    private val sysfsMinValue = 1
+    @Volatile private var sysfsAvailableCache: Boolean? = null
+    @Volatile private var sysfsMaxCache: Int = -1
+    @Volatile private var lastSysfsValue: Int = -1
+    @Volatile private var backlightIdCache: Int = -1
 
     override fun initZygote(startupParam: IXposedHookZygoteInit.StartupParam?) {
         logOnce("zygote", "initZygote minBrightnessFloat=$minBrightnessFloat")
@@ -51,6 +63,7 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
     private fun hookSystemServer(classLoader: ClassLoader) {
         hookBrightnessInfo(classLoader, "system")
+        hookLightsServiceBacklight(classLoader)
         hookDisplayDeviceConfig(classLoader)
         hookBrightnessClamperController(classLoader)
         hookDisplayBrightnessController(classLoader)
@@ -200,6 +213,36 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
         }
 
         logOnce("displaymanager_setters", "DisplayManager brightness setters hooked ($count)")
+    }
+
+    private fun hookLightsServiceBacklight(classLoader: ClassLoader) {
+        val lightImplClass = XposedHelpers.findClassIfExists(
+            "com.android.server.lights.LightsService\$LightImpl",
+            classLoader
+        ) ?: run {
+            logOnce("lights_impl_missing", "LightsService.LightImpl not found")
+            return
+        }
+
+        val hooks = XposedBridge.hookAllMethods(
+            lightImplClass,
+            "setBrightness",
+            object : XC_MethodHook() {
+                override fun beforeHookedMethod(param: MethodHookParam) {
+                    if (!isBacklightLight(param.thisObject, classLoader)) return
+                    val brightness = extractBrightnessArg(param.args) ?: return
+                    if (applySysfsBacklight(brightness)) {
+                        param.result = null
+                        logWhenValueChanges(
+                            "sysfs_backlight",
+                            brightness,
+                            "sysfs backlight brightness=$brightness"
+                        )
+                    }
+                }
+            }
+        )
+        logHookResult("lights_setbrightness_hooks", "LightsService.LightImpl#setBrightness", hooks.size)
     }
 
     private fun hookSystemUiBrightnessInfoMethods(
@@ -683,6 +726,127 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
         return Float.NaN
     }
 
+    private fun extractBrightnessArg(args: Array<Any?>): Float? {
+        for (arg in args) {
+            when (arg) {
+                is Float -> return arg
+                is Double -> return arg.toFloat()
+                is Int -> {
+                    return if (arg in 0..255) {
+                        arg / 255f
+                    } else {
+                        arg.toFloat()
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    private fun isBacklightLight(light: Any?, classLoader: ClassLoader): Boolean {
+        if (light == null) return false
+        val backlightId = getBacklightId(classLoader)
+        val id = getIntFieldOrNull(light, listOf("mId", "mLightId", "mType"))
+        if (id != null) {
+            return if (backlightId >= 0) id == backlightId else id == 0
+        }
+
+        val methodId = callIntMethodOrNull(light, listOf("getId", "getType"))
+        if (methodId != null) {
+            return if (backlightId >= 0) methodId == backlightId else methodId == 0
+        }
+
+        return false
+    }
+
+    private fun getBacklightId(classLoader: ClassLoader): Int {
+        if (backlightIdCache >= 0) return backlightIdCache
+        val lightClass = XposedHelpers.findClassIfExists(
+            "android.hardware.lights.Light",
+            classLoader
+        )
+        if (lightClass != null) {
+            val fieldNames = listOf("LIGHT_ID_BACKLIGHT", "LIGHT_TYPE_BACKLIGHT", "TYPE_BACKLIGHT")
+            for (name in fieldNames) {
+                try {
+                    val value = XposedHelpers.getStaticIntField(lightClass, name)
+                    backlightIdCache = value
+                    return value
+                } catch (_: Throwable) {
+                }
+            }
+        }
+
+        backlightIdCache = 0
+        return 0
+    }
+
+    private fun applySysfsBacklight(brightness: Float): Boolean {
+        if (!sysfsOverrideEnabled) return false
+        if (brightness.isNaN()) return false
+        if (brightness > sysfsOverrideThreshold) return false
+        if (!isSysfsAvailable()) return false
+
+        val max = getSysfsMaxValue()
+        if (max <= 0) return false
+
+        var value = (brightness * max).roundToInt()
+        if (value < sysfsMinValue) value = sysfsMinValue
+
+        if (value == lastSysfsValue) return true
+        return if (writeSysfsInt(sysfsBacklightPath, value)) {
+            lastSysfsValue = value
+            true
+        } else {
+            false
+        }
+    }
+
+    private fun isSysfsAvailable(): Boolean {
+        val cached = sysfsAvailableCache
+        if (cached != null) return cached
+        val file = File(sysfsBacklightPath)
+        val available = file.exists() && file.canWrite()
+        sysfsAvailableCache = available
+        if (!available) {
+            logOnce("sysfs_unavailable", "Sysfs backlight not writable: $sysfsBacklightPath")
+        }
+        return available
+    }
+
+    private fun getSysfsMaxValue(): Int {
+        if (sysfsMaxCache > 0) return sysfsMaxCache
+        val max = readSysfsInt(sysfsMaxBacklightPath)
+        if (max != null && max > 0) {
+            sysfsMaxCache = max
+            return max
+        }
+        if (sysfsMaxCache != 0) {
+            sysfsMaxCache = 0
+            logOnce("sysfs_max_missing", "Sysfs max_brightness not readable: $sysfsMaxBacklightPath")
+        }
+        return 0
+    }
+
+    private fun readSysfsInt(path: String): Int? {
+        return try {
+            File(path).readText().trim().toInt()
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun writeSysfsInt(path: String, value: Int): Boolean {
+        return try {
+            FileOutputStream(path).use { stream ->
+                stream.write(value.toString().toByteArray())
+            }
+            true
+        } catch (_: Throwable) {
+            false
+        }
+    }
+
     private fun getIntField(info: Any?, fieldNames: List<String>): Int {
         if (info == null) return 0
         for (name in fieldNames) {
@@ -703,6 +867,28 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
             }
         }
         return false
+    }
+
+    private fun getIntFieldOrNull(target: Any?, fieldNames: List<String>): Int? {
+        if (target == null) return null
+        for (name in fieldNames) {
+            try {
+                return XposedHelpers.getIntField(target, name)
+            } catch (_: Throwable) {
+            }
+        }
+        return null
+    }
+
+    private fun callIntMethodOrNull(target: Any?, methodNames: List<String>): Int? {
+        if (target == null) return null
+        for (name in methodNames) {
+            try {
+                return XposedHelpers.callMethod(target, name) as? Int
+            } catch (_: Throwable) {
+            }
+        }
+        return null
     }
 
     private fun findStringArg(args: Array<Any?>): String? {
