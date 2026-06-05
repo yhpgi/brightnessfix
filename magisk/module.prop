@@ -1,0 +1,6 @@
+id=brightnessfix_hwdim
+name=BrightnessFix Hardware Dimmer
+version=v1.0
+versionCode=1
+author=yazed
+description=Forces a lower hardware backlight floor via sysfs for extra dimming at minimum brightness. Re-asserts the value whenever the framework reverts it. Tune FLOOR/TRIGGER/PATH in brightnessfix.conf.
