@@ -84,6 +84,7 @@ chmod 0666 "$BL_PATH" 2>/dev/null
 chmod 0666 "$MAX_PATH" 2>/dev/null
 
 run() {
+  last_seen=-1
   last_written=-1
   logged_max=0
   stable_loops=0
@@ -115,12 +116,30 @@ run() {
 
     # Screen off -> nothing to enforce; reset state.
     if [ "$cur" -eq 0 ]; then
+      last_seen=-1
       last_written=-1
       stable_loops=0
       current_sleep="$POLL_OFF"
       sleep "$POLL_OFF"
       continue
     fi
+
+    #  if hardware value has not changed, skip all enforcement math
+    if [ "$cur" -eq "$last_seen" ]; then
+      stable_loops=$((stable_loops + 1))
+      # Back off polling after stable periods to reduce wakeups
+      if [ "$stable_loops" -ge 20 ]; then
+        current_sleep=8
+      elif [ "$stable_loops" -ge 8 ]; then
+        current_sleep=4
+      else
+        current_sleep="$POLL_ON"
+      fi
+      sleep "$current_sleep"
+      continue
+    fi
+
+    last_seen=$cur
 
     # Only act when the value actually changed since our last write, so we
     # never fight our own output.
@@ -134,16 +153,6 @@ run() {
       else
         # Outside trigger window; let framework own it.
         last_written=$cur
-      fi
-    else
-      stable_loops=$((stable_loops + 1))
-      # Back off polling after stable periods to reduce wakeups.
-      if [ "$stable_loops" -ge 20 ]; then
-        current_sleep=8
-      elif [ "$stable_loops" -ge 8 ]; then
-        current_sleep=4
-      else
-        current_sleep="$POLL_ON"
       fi
     fi
 
