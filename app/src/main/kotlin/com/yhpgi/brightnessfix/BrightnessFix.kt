@@ -13,6 +13,8 @@ import kotlin.math.abs
 class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
 
     private val logTag = "BrightnessFix"
+    // Keep diagnostics off in production to minimize hook overhead.
+    private val debugDiagnostics = false
     // Legacy int config (0-255). Kept >= 1 to avoid edge cases in older brightness math.
     private val minBrightnessInt = 1
     // Android 12+/16 QPR2 float config. 0.0 is the dimmest valid "on" brightness.
@@ -66,8 +68,10 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
     private fun hookSystemUi(classLoader: ClassLoader) {
         safe("hookBrightnessInfo:systemui") { hookBrightnessInfo(classLoader, "systemui") }
         safe("hookDisplayBrightnessInfo") { hookDisplayBrightnessInfo(classLoader) }
-        safe("hookDisplayManagerBrightnessSetters") { hookDisplayManagerBrightnessSetters(classLoader) }
-        safe("hookSettingsSystem") { hookSettingsSystem(classLoader) }
+        if (debugDiagnostics) {
+            safe("hookDisplayManagerBrightnessSetters") { hookDisplayManagerBrightnessSetters(classLoader) }
+            safe("hookSettingsSystem") { hookSettingsSystem(classLoader) }
+        }
         safe("hookBrightnessController") { hookBrightnessController(classLoader) }
     }
 
@@ -773,6 +777,7 @@ class BrightnessFix : IXposedHookZygoteInit, IXposedHookLoadPackage {
     }
 
     private fun logWhenValueChanges(key: String, value: Float, message: String) {
+        if (!debugDiagnostics) return
         if (value.isNaN()) return
         val prev = lastFloatValues.put(key, value)
         if (prev == null || abs(prev - value) > 0.0001f) {

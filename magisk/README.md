@@ -58,8 +58,8 @@ Edit `brightnessfix.conf` (after install it lives at
 ### Finding your TRIGGER value
 1. Set screen brightness to **minimum**.
 2. Open the daemon log: `/data/adb/modules/brightnessfix_hwdim/brightnessfix.log`.
-3. Note the `range: max_brightness=<M> first_read=<N>` and any `observed: <N>` line
-   — `<N>` at minimum is your target. Set `TRIGGER` to that (or slightly higher).
+3. Note `range: max_brightness=<M> first_read=<N>`.
+  Use `<N>` at minimum as your target and set `TRIGGER` to that (or slightly higher).
    Keep `TRIGGER > FLOOR`.
 
 After editing, reboot (or kill the daemon process and re-run `service.sh`).

@@ -69,13 +69,12 @@ Main keys:
 
 /data/adb/modules/brightnessfix_hwdim/brightnessfix.log
 
-3. Find lines like:
+3. Find the line:
 - range: max_brightness=... first_read=...
-- observed: N (no action; trigger=... floor=...)
 
 4. Set:
 - FLOOR to your preferred dim integer (usually 1 to 3)
-- TRIGGER to the observed minimum value (or slightly higher)
+- TRIGGER to first_read (or slightly higher)
 
 5. Reboot after edits.
 

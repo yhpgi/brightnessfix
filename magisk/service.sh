@@ -11,8 +11,8 @@ BL_PATH="/sys/class/leds/lcd-backlight/brightness"
 MAX_PATH="/sys/class/leds/lcd-backlight/max_brightness"
 FLOOR=1
 TRIGGER=12
-POLL_ON=0.4
-POLL_OFF=2
+POLL_ON=1.5
+POLL_OFF=30
 
 CONF="$MODDIR/brightnessfix.conf"
 [ -f "$CONF" ] && . "$CONF"
@@ -86,6 +86,8 @@ chmod 0666 "$MAX_PATH" 2>/dev/null
 run() {
   last_written=-1
   logged_max=0
+  stable_loops=0
+  current_sleep="$POLL_ON"
   while true; do
     if [ ! -e "$BL_PATH" ]; then
       if ! detect_backlight_paths; then
@@ -114,6 +116,8 @@ run() {
     # Screen off -> nothing to enforce; reset state.
     if [ "$cur" -eq 0 ]; then
       last_written=-1
+      stable_loops=0
+      current_sleep="$POLL_OFF"
       sleep "$POLL_OFF"
       continue
     fi
@@ -121,19 +125,29 @@ run() {
     # Only act when the value actually changed since our last write, so we
     # never fight our own output.
     if [ "$cur" -ne "$last_written" ]; then
+      stable_loops=0
+      current_sleep="$POLL_ON"
       if [ "$cur" -le "$TRIGGER" ] && [ "$cur" -gt "$FLOOR" ]; then
         echo "$FLOOR" > "$BL_PATH" 2>/dev/null
         last_written=$FLOOR
         log "enforced floor: $cur -> $FLOOR"
       else
-        # Outside the trigger window; let the framework own it. Logged so you
-        # can see what value the slider's minimum actually produces.
+        # Outside trigger window; let framework own it.
         last_written=$cur
-        log "observed: $cur (no action; trigger=$TRIGGER floor=$FLOOR)"
+      fi
+    else
+      stable_loops=$((stable_loops + 1))
+      # Back off polling after stable periods to reduce wakeups.
+      if [ "$stable_loops" -ge 20 ]; then
+        current_sleep=8
+      elif [ "$stable_loops" -ge 8 ]; then
+        current_sleep=4
+      else
+        current_sleep="$POLL_ON"
       fi
     fi
 
-    sleep "$POLL_ON"
+    sleep "$current_sleep"
   done
 }
 
